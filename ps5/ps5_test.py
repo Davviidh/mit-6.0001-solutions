@@ -1,6 +1,12 @@
 # 6.00
 # Problem Set 5 Test Suite
+from io import BytesIO
+from pathlib import Path
+import tempfile
 import unittest
+
+import feedparser
+from project_util import translate_html
 from ps5 import *
 from datetime import timedelta
 
@@ -244,9 +250,123 @@ class ProblemSet5(unittest.TestCase):
         self.assertEqual(2, len(filtered_stories))
 
 
-if __name__ == "__main__":
-    suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(ProblemSet5NewsStory))
-    suite.addTest(unittest.makeSuite(ProblemSet5))
-    unittest.TextTestRunner(verbosity=2).run(suite)
+class ProblemSet5Regression(unittest.TestCase):
+    def testVerifiedSslContextHasTrustedCertificates(self):
+        context = feedparser._create_verified_ssl_context()
+        self.assertGreater(len(context.get_ca_certs()), 0)
 
+    def testTimeTriggersInterpretInputAsEST(self):
+        before = BeforeTrigger('12 Oct 2016 23:59:59')
+        after = AfterTrigger('12 Oct 2016 23:59:59')
+
+        self.assertEqual(before.time.utcoffset(), timedelta(hours=-5))
+
+        naive_before = NewsStory('', '', '', '', datetime(2016, 10, 12, 23, 59, 58))
+        naive_after = NewsStory('', '', '', '', datetime(2016, 10, 13, 0, 0, 0))
+        self.assertTrue(before.evaluate(naive_before))
+        self.assertTrue(after.evaluate(naive_after))
+
+        same_in_utc = NewsStory(
+            '', '', '', '',
+            pytz.utc.localize(datetime(2016, 10, 13, 4, 59, 59)),
+        )
+        self.assertFalse(before.evaluate(same_in_utc))
+        self.assertFalse(after.evaluate(same_in_utc))
+
+    def testTranslateHtmlPreservesAmpersandsAndUnicode(self):
+        self.assertEqual(
+            translate_html('AT&T announces results in München'),
+            'AT&T announces results in München',
+        )
+        self.assertEqual(
+            translate_html('Fran&ccedil;ois &amp; Co.'),
+            'François & Co.',
+        )
+
+    def testProcessParsesRssWithoutTruncatingTitle(self):
+        rss = '''
+            <rss><channel><item>
+              <guid>story-1</guid>
+              <title>AT&amp;T opens in München</title>
+              <link>https://example.com/story-1</link>
+              <description>&lt;b&gt;Café update&lt;/b&gt;</description>
+              <pubDate>Sat, 29 Aug 2026 12:00:00 GMT</pubDate>
+            </item></channel></rss>
+        '''
+        story = process(BytesIO(rss.encode('utf-8')))[0]
+
+        self.assertEqual(story.get_title(), 'AT&T opens in München')
+        self.assertEqual(story.get_description(), 'Café update')
+        self.assertEqual(story.get_link(), 'https://example.com/story-1')
+        self.assertEqual(story.get_pubdate().utcoffset(), timedelta(0))
+
+    def testAtomLinkAndIsoTimestamp(self):
+        atom = '''
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <id>story-2</id>
+                <title>Markets &amp; München</title>
+                <link href="https://example.com/story-2"/>
+                <summary>Summary</summary>
+                <updated>2026-08-29T12:00:00Z</updated>
+              </entry>
+            </feed>
+        '''
+
+        parsed_entry = feedparser.parse(BytesIO(atom.encode('utf-8'))).entries[0]
+        self.assertEqual(parsed_entry.link, 'https://example.com/story-2')
+
+        story = process(BytesIO(atom.encode('utf-8')))[0]
+        self.assertEqual(story.get_link(), 'https://example.com/story-2')
+        self.assertEqual(
+            story.get_pubdate(),
+            pytz.utc.localize(datetime(2026, 8, 29, 12, 0, 0)),
+        )
+
+    def testReadTriggerConfigSupportsEveryTriggerType(self):
+        config = '''// comment
+
+title,TITLE,Purple Cow
+description,DESCRIPTION,Market
+before,BEFORE,30 Aug 2026 12:00:00
+after,AFTER,28 Aug 2026 12:00:00
+not_title,NOT,title
+both,AND,title,description
+either,OR,title,description
+ADD,title,description,before,after,not_title,both,either
+'''
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / 'triggers.txt'
+            config_path.write_text(config, encoding='utf-8')
+            triggers = read_trigger_config(config_path)
+
+        story = NewsStory(
+            '', 'Purple cow!', 'Market report', '',
+            datetime(2026, 8, 29, 12, 0, 0),
+        )
+        self.assertEqual(
+            [trigger.evaluate(story) for trigger in triggers],
+            [True, True, True, True, False, True, True],
+        )
+
+    def testDebateTriggerFileDefinesThreeHourWindow(self):
+        config_path = Path(__file__).with_name('debate_triggers.txt')
+        triggers = read_trigger_config(config_path)
+        self.assertEqual(len(triggers), 1)
+
+        inside = NewsStory('', '', '', '', datetime(2016, 10, 19, 21, 0, 0))
+        too_early = NewsStory('', '', '', '', datetime(2016, 10, 19, 17, 59, 59))
+        too_late = NewsStory('', '', '', '', datetime(2016, 10, 20, 0, 0, 1))
+        self.assertTrue(triggers[0].evaluate(inside))
+        self.assertFalse(triggers[0].evaluate(too_early))
+        self.assertFalse(triggers[0].evaluate(too_late))
+
+
+if __name__ == "__main__":
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite()
+    suite.addTests(loader.loadTestsFromTestCase(ProblemSet5NewsStory))
+    suite.addTests(loader.loadTestsFromTestCase(ProblemSet5))
+    suite.addTests(loader.loadTestsFromTestCase(ProblemSet5Regression))
+    unittest.TextTestRunner(verbosity=2).run(suite)
