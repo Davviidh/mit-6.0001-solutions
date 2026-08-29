@@ -5,8 +5,8 @@
 
 import feedparser
 import string
-import time
 import threading
+from pathlib import Path
 from project_util import translate_html
 from mtTkinter import *
 from datetime import datetime
@@ -20,6 +20,28 @@ import pytz
 # Google and Yahoo News feeds
 # Do not change this code
 #======================
+
+def _parse_pubdate(pubdate):
+    """Return an aware datetime for an RSS or Atom publication timestamp."""
+    try:
+        parsed = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %Z")
+        return parsed.replace(tzinfo=pytz.timezone("GMT"))
+    except ValueError:
+        pass
+
+    try:
+        return datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %z")
+    except ValueError:
+        pass
+
+    # Atom feeds use ISO 8601/RFC 3339 timestamps. ``fromisoformat`` does not
+    # understand a trailing Z on older Python 3 releases, so normalize it.
+    iso_pubdate = pubdate[:-1] + "+00:00" if pubdate.endswith("Z") else pubdate
+    parsed = datetime.fromisoformat(iso_pubdate)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=pytz.utc)
+    return parsed
+
 
 def process(url):
     """
@@ -36,11 +58,7 @@ def process(url):
         description = translate_html(entry.description)
         pubdate = translate_html(entry.published)
 
-        try:
-            pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %Z")
-            pubdate = pubdate.replace(tzinfo=pytz.timezone("GMT"))
-        except ValueError:
-            pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %z")
+        pubdate = _parse_pubdate(pubdate)
 
         newsStory = NewsStory(guid, title, description, link, pubdate)
         ret.append(newsStory)
@@ -128,25 +146,25 @@ class DescriptionTrigger(PhraseTrigger):
 class TimeTrigger(Trigger):
     def __init__(self, time_str):
         naive_datetime = datetime.strptime(time_str, "%d %b %Y %H:%M:%S")
-        self.time = naive_datetime.replace(tzinfo=pytz.utc)
+        self.time = pytz.timezone("EST").localize(naive_datetime)
 
 # Problem 6
 class BeforeTrigger(TimeTrigger):
     def evaluate(self, story):
         pubdate = story.get_pubdate()
         if pubdate.tzinfo is None:
-            pubdate = pubdate.replace(tzinfo=pytz.utc)
+            pubdate = pytz.timezone("EST").localize(pubdate)
         else:
-            pubdate = pubdate.astimezone(pytz.utc)
+            pubdate = pubdate.astimezone(pytz.timezone("EST"))
         return pubdate < self.time
 
 class AfterTrigger(TimeTrigger):
     def evaluate(self, story):
         pubdate = story.get_pubdate()
         if pubdate.tzinfo is None:
-            pubdate = pubdate.replace(tzinfo=pytz.utc)
+            pubdate = pytz.timezone("EST").localize(pubdate)
         else:
-            pubdate = pubdate.astimezone(pytz.utc)
+            pubdate = pubdate.astimezone(pytz.timezone("EST"))
         return pubdate > self.time
 
 # COMPOSITE TRIGGERS
@@ -209,12 +227,16 @@ def read_trigger_config(filename):
     Returns: a list of trigger objects specified by the trigger configuration
         file.
     """
-    trigger_file = open(filename, 'r')
+    config_path = Path(filename)
+    if not config_path.is_absolute() and not config_path.exists():
+        config_path = Path(__file__).resolve().parent / config_path
+
     lines = []
-    for line in trigger_file:
-        line = line.rstrip()
-        if not (len(line) == 0 or line.startswith('//')):
-            lines.append(line)
+    with config_path.open('r', encoding='utf-8') as trigger_file:
+        for line in trigger_file:
+            line = line.rstrip()
+            if not (len(line) == 0 or line.startswith('//')):
+                lines.append(line)
             
     trigger_map = {}
     active_triggers = []
@@ -247,7 +269,10 @@ def read_trigger_config(filename):
 
 SLEEPTIME = 120 #seconds -- how often we poll
 
-def main_thread(master):
+def main_thread(master, stop_event=None):
+    if stop_event is None:
+        stop_event = threading.Event()
+
     try:
         # Problem 11
         triggerlist = read_trigger_config('triggers.txt')
@@ -266,7 +291,11 @@ def main_thread(master):
         cont = Text(master, font=("Helvetica", 14), yscrollcommand=scrollbar.set)
         cont.pack(side=BOTTOM)
         cont.tag_config("title", justify='center')
-        button = Button(frame, text="Exit", command=root.destroy)
+        def close_window():
+            stop_event.set()
+            master.destroy()
+
+        button = Button(frame, text="Exit", command=close_window)
         button.pack(side=BOTTOM)
         guidShown = []
         
@@ -278,10 +307,13 @@ def main_thread(master):
                 cont.insert(END, "\n*********************************************************************\n", "title")
                 guidShown.append(newstory.get_guid())
 
-        while True:
+        while not stop_event.is_set():
             print("Polling . . .", end=' ')
             # Get stories from Google's Top Stories RSS news feed
             stories = process("https://news.google.com/rss") 
+
+            if stop_event.is_set():
+                break
 
             stories = filter_stories(stories, triggerlist)
 
@@ -289,15 +321,25 @@ def main_thread(master):
             scrollbar.config(command=cont.yview)
 
             print("Sleeping...")
-            time.sleep(SLEEPTIME)
+            stop_event.wait(SLEEPTIME)
 
     except Exception as e:
-        print(e)
+        if not stop_event.is_set():
+            print(e)
 
 
 if __name__ == '__main__':
     root = Tk()
     root.title("Some RSS parser")
-    t = threading.Thread(target=main_thread, args=(root,))
+    stop_event = threading.Event()
+
+    def close_window():
+        stop_event.set()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_window)
+    t = threading.Thread(target=main_thread, args=(root, stop_event), daemon=True)
     t.start()
     root.mainloop()
+    stop_event.set()
+    t.join(timeout=1)

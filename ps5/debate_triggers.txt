@@ -1,0 +1,6 @@
+// The October 19, 2016 presidential debate began at 9:00 PM Eastern.
+// Select stories published in the three hours before or after it.
+debate_after,AFTER,19 Oct 2016 18:00:00
+debate_before,BEFORE,20 Oct 2016 00:00:00
+debate_window,AND,debate_after,debate_before
+ADD,debate_window

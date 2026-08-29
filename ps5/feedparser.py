@@ -1,6 +1,35 @@
 import urllib.request
 import xml.etree.ElementTree as ET
-import ssl  # 1. Imported the ssl module
+import ssl
+from pathlib import Path
+
+
+NETWORK_TIMEOUT = 15
+SYSTEM_CA_FILES = (
+    Path("/etc/ssl/cert.pem"),
+    Path("/private/etc/ssl/cert.pem"),
+)
+
+
+def _create_verified_ssl_context():
+    """Return a verified TLS context, including Python.org macOS installs.
+
+    Python.org's macOS interpreter can be installed without its optional
+    certificate-linking step. In that case OpenSSL reports no default CA file,
+    even though macOS provides a current CA bundle at /etc/ssl/cert.pem.
+    """
+    verify_paths = ssl.get_default_verify_paths()
+    if verify_paths.cafile or verify_paths.capath:
+        return ssl.create_default_context()
+
+    for ca_file in SYSTEM_CA_FILES:
+        if ca_file.is_file():
+            return ssl.create_default_context(cafile=str(ca_file))
+
+    # Keep certificate verification enabled. If this context has no trust
+    # anchors, urlopen will raise a useful verification error instead of
+    # silently accepting an untrusted connection.
+    return ssl.create_default_context()
 
 class FeedParserDict(dict):
     """Custom dictionary subclass allowing both key and attribute access."""
@@ -23,9 +52,10 @@ def parse(url_or_file):
                 url_or_file, 
                 headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
             )
-            # 2. Create an unverified SSL context to bypass the macOS certificate bug
-            context = ssl._create_unverified_context()
-            with urllib.request.urlopen(req, context=context) as response:
+            context = _create_verified_ssl_context()
+            with urllib.request.urlopen(
+                req, context=context, timeout=NETWORK_TIMEOUT
+            ) as response:
                 xml_data = response.read()
         else:
             # Handle local file stream or path
@@ -57,7 +87,9 @@ def parse(url_or_file):
                 entry.guid = item.findtext('a:id', namespaces=ns) or item.findtext('id') or ''
                 entry.title = item.findtext('a:title', namespaces=ns) or item.findtext('title') or ''
                 
-                link_el = item.find('a:link', ns) or item.find('link')
+                link_el = item.find('a:link', ns)
+                if link_el is None:
+                    link_el = item.find('link')
                 entry.link = link_el.attrib.get('href', '') if link_el is not None else ''
                     
                 entry.description = (item.findtext('a:summary', namespaces=ns) or 
